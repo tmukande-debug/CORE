@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 #from recbole.model.layers import TransformerEncoder
 import torch
-from block_recurrent_transformer_pytorch import BlockRecurrentTransformer
+from block_recurrent_transformer_pytorch import*
 
 from core_ave import COREave
 
@@ -54,11 +54,232 @@ class TransNet(nn.Module):
         out, mems2, states2 =  self.trm_encoder(item_seq, xl_memories = mems1, states = states1)
         out, mems3, states3 =  self.trm_encoder(item_seq, xl_memories = mems2, states = states2)
         
-        self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
-        self.dropout = nn.Dropout(self.hidden_dropout_prob)
-        self.fn = nn.Linear(self.hidden_size, 1)
+        num_state_vectors = default(num_state_vectors, block_width)
+        xl_memories_layers = default(xl_memories_layers, tuple(range(1, depth + 1)))
+        self.xl_memories_layers = set(xl_memories_layers)
 
-        self.apply(self._init_weights)
+        assert all([0 < layer <= depth for layer in xl_memories_layers])
+
+        recurrent_layers = default(recurrent_layers, (depth // 2,)) # default to one recurent layer at middle of the network
+        self.recurrent_layers = set(recurrent_layers)
+
+        assert all([0 < layer <= depth for layer in recurrent_layers])
+
+        self.token_emb = nn.Embedding(num_tokens, dim)
+
+        pos_mlp_dim = default(dynamic_pos_bias_dim, dim // 4)
+        self.dynamic_pos_bias_mlp = nn.Sequential(
+            nn.Linear(1, pos_mlp_dim),
+            nn.SiLU(),
+            nn.Linear(pos_mlp_dim, pos_mlp_dim),
+            nn.SiLU(),
+            nn.Linear(pos_mlp_dim, heads)
+        )
+
+        self.layers = nn.ModuleList([])
+
+        for layer in range(1, depth + 1):
+            is_recurrent_layer = layer in self.recurrent_layers
+            is_xl_layer = layer in self.xl_memories_layers
+
+            layer_num_state_vectors = num_state_vectors if is_recurrent_layer else 0
+
+            # only layers with xl memories
+            # or has recurrence in horizontal direction
+            # use qk rmsnorm (in paper, they use cosine sim attention, but i think qk rmsnorm is more proven given Vit 22B paper)
+            # one can also override to use all qk rmsnorm by setting all_layers_qk_rmsnorm = True
+
+            qk_rmsnorm = all_layers_qk_rmsnorm or is_recurrent_layer or is_xl_layer
+
+            self.layers.append(nn.ModuleList([
+                AttentionBlock(
+                    dim,
+                    causal = True,
+                    block_width = block_width,
+                    dim_head = dim_head,
+                    heads = heads,
+                    single_head_kv = single_head_kv,
+                    qk_rmsnorm = qk_rmsnorm,
+                    num_state_vectors = layer_num_state_vectors
+                ),
+                FeedForward(dim, mult = ff_mult)
+            ]))
+
+        self.to_logits = nn.Sequential(
+            LayerNorm(dim),
+            nn.Linear(dim, num_tokens, bias = False)
+        )
+
+        self.max_seq_len = max_seq_len
+        self.block_width = block_width
+
+        assert divisible_by(max_seq_len, block_width)
+
+        self.ignore_index = ignore_index
+
+        self.enhanced_recurrence = enhanced_recurrence
+
+    @torch.no_grad()
+    @eval_decorator
+    def generate(
+        self,
+        prime,
+        length = None,
+        xl_memories: List[torch.Tensor] = [],
+        states: List[torch.Tensor] = [],
+        temperature = 1.,
+        filter_thres = 0.9,
+        return_memories_and_states = False
+    ):
+        length = default(length, self.max_seq_len + 1)
+        start_len = prime.shape[-1]
+
+        assert start_len < self.max_seq_len
+        assert length <= (self.max_seq_len + 1)
+        assert start_len < length
+
+        output = prime
+
+        memories = []
+        states = []
+
+        for ind in range(length - start_len):
+
+            logits, next_memories, next_states = self.forward(
+                output,
+                xl_memories = xl_memories,
+                states = states
+            )
+
+            logits = logits[:, -1]
+
+            filtered_logits = top_k(logits, thres = filter_thres)
+            sampled = gumbel_sample(filtered_logits, temperature = temperature)
+            sampled = rearrange(sampled, 'b -> b 1')
+
+            output = torch.cat((output, sampled), dim = -1)
+
+            if divisible_by(output.shape[-1] - 1, self.max_seq_len): # on the sampling of the last token in the current window, set new memories and states
+                memories = next_memories
+                states = next_states
+
+        output = output[:, start_len:]
+
+        if return_memories_and_states:
+            return output, memories, states
+
+        return output
+
+    def forward(
+        self,
+        x,
+        return_loss = False,
+        xl_memories: List[torch.Tensor] = [],
+        states: List[torch.Tensor] = [],
+        return_memories_and_states = None  # can force to either return memory + state or not. by default will only return when number of tokens == max_seq_len
+    ):
+        device = x.device
+
+        if return_loss:
+            x, labels = x[:, :-1], x[:, 1:]
+
+        # get sequence length i and j for dynamic pos bias
+
+        assert x.shape[-1] <= self.max_seq_len
+
+        w = self.block_width
+
+        # token embedding
+
+        x = self.token_emb(x)
+
+        # dynamic pos bias
+
+        rel_dist = torch.arange(w, dtype = x.dtype, device = device)
+        rel_dist = rearrange(rel_dist, '... -> ... 1')
+        pos_bias = self.dynamic_pos_bias_mlp(rel_dist)
+
+        i_arange = torch.arange(w, device = device)
+        j_arange = torch.arange(w * 2, device = device)
+        rel_pos = ((rearrange(i_arange, 'i -> i 1') + w) - rearrange(j_arange, 'j -> 1 j')).abs()
+
+        attn_mask = rel_pos < w  # make sure each token only looks back a block width
+        rel_pos = rel_pos.masked_fill(~attn_mask, 0)
+
+        pos_bias = pos_bias[rel_pos]
+        pos_bias = rearrange(pos_bias, 'i j h -> h i j')
+
+        # enhanced recurrence
+
+        if self.enhanced_recurrence and len(xl_memories) > 1:
+            xl_memories = [*xl_memories[1:], xl_memories[0]]
+
+        # ready xl memories and states
+
+        xl_memories = iter(xl_memories)
+        states = iter(states)
+
+        next_xl_memories = []
+        next_states = []
+
+        return_memories_and_states = default(return_memories_and_states, self.max_seq_len == x.shape[-2])
+
+        # go through layers
+
+        for ind, (attn, ff) in enumerate(self.layers):
+
+            # determine if the layer requires transformer xl memories
+
+            layer = ind + 1
+
+            is_xl_layer     = layer in self.xl_memories_layers
+            is_state_layer  = attn.is_recurrent_layer
+
+            # whether to pass in xl memories
+
+            attn_kwargs = dict(
+                rel_pos_bias = pos_bias,
+                attn_mask = attn_mask,
+                return_memories_and_states = return_memories_and_states
+            )
+
+            if is_xl_layer:
+                attn_kwargs.update(xl_memories = next(xl_memories, None))
+
+            if is_state_layer:
+                attn_kwargs.update(states = next(states, None))
+
+            # attention layer
+
+            residual = x
+            attn_branch_out, layer_xl_memories, layer_next_states = attn(x, **attn_kwargs)
+
+            if return_memories_and_states:
+                # save states if needed
+
+                if exists(layer_next_states):
+                    next_states.append(layer_next_states.detach())
+
+                # save current xl memories if needed
+
+                if is_xl_layer:
+                    next_xl_memories.append(layer_xl_memories.detach())
+
+            x = attn_branch_out + residual
+
+            # feedforward layer
+
+            x = ff(x) + x
+
+        logits = self.to_logits(x)
+
+        if not return_loss:
+            return logits, next_xl_memories, next_states
+
+        logits = rearrange(logits, 'b n c -> b c n')
+        loss = F.cross_entropy(logits, labels, ignore_index = self.ignore_index)
+
+        return loss, next_xl_memories, next_states
 
     def get_attention_mask(self, item_seq, bidirectional=False):
         """Generate left-to-right uni-directional or bidirectional attention mask for multi-head attention."""
