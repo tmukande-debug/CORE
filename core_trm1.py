@@ -4,8 +4,90 @@ import torch.nn.functional as F
 #from recbole.model.layers import TransformerEncoder
 import torch
 from block_recurrent_transformer_pytorch import*
+from torch import nn, einsum
+
+from einops import rearrange, repeat
+
+from beartype import beartype
+from beartype.door import is_bearable
+from beartype.typing import Optional, List, Tuple
 
 from core_ave import COREave
+
+
+# helpers
+
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+def eval_decorator(fn):
+    def inner(self, *args, **kwargs):
+        was_training = self.training
+        self.eval()
+        out = fn(self, *args, **kwargs)
+        self.train(was_training)
+        return out
+    return inner
+
+def divisible_by(numer, denom):
+    return (numer % denom) == 0
+
+def l2norm(t):
+    return F.normalize(t, dim = -1)
+
+def pad_at_dim(t, pad, dim = -1, value = 0.):
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
+
+# bias-less layernorm
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
+
+# sampling helpers
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1):
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim)
+
+def top_k(logits, thres = 0.9):
+    k = math.ceil((1 - thres) * logits.shape[-1])
+    val, ind = torch.topk(logits, k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(1, ind, val)
+    return probs
+
+# geglu feedforward
+
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim = -1)
+        return F.gelu(gate) * x
+
+def FeedForward(dim, mult = 4):
+    inner_dim = int(dim * mult * 2 / 3)
+    return nn.Sequential(
+        LayerNorm(dim),
+        nn.Linear(dim, inner_dim * 2, bias = False),
+        GEGLU(),
+        nn.Linear(inner_dim, dim, bias = False)
+    )
 
 
 class TransNet(nn.Module):
@@ -34,7 +116,12 @@ class TransNet(nn.Module):
         self.hidden_act = config['hidden_act']
         self.layer_norm_eps = config['layer_norm_eps']
         self.initializer_range = config['initializer_range']
-
+        self.output_all_encoded_layers = config['output_all_encoded_layers']
+        #num_state_vectors = default(num_state_vectors, block_width)
+        #xl_memories_layers = default(xl_memories_layers, tuple(range(1, depth + 1)))
+        #self.xl_memories_layers = set(xl_memories_layers)
+        #dynamic_pos_bias_dim = self.dynamic_pos_bias_dim
+        self.layers = nn.ModuleList([])
 
         self.position_embedding = nn.Embedding(dataset.field2seqlen['item_id_list'], self.hidden_size)
         self.trm_encoder = BlockRecurrentTransformer(
@@ -48,76 +135,13 @@ class TransNet(nn.Module):
            xl_memories_layers = (5, 6),    # which layers to use xl memories. very old deepmind papers have shown you only need the last penultimate layers to have cached key values to see majority of benefit
            num_state_vectors = 512,        # number of state vectors, i believe this was a single block size in the paper, but can be any amount
            recurrent_layers = (4,),        # where to place the recurrent layer(s) for states with fixed simple gating
-           enhanced_recurrence = True      # enhanced recurrence from ernie-doc paper, i have seen it to work well on my local machine
+           enhanced_recurrence = True,
+           #dynamic_pos_bias_dim = None     # enhanced recurrence from ernie-doc paper, i have seen it to work well on my local machine
           )
-        out, mems1, states1 =  self.trm_encoder(item_seq)
-        out, mems2, states2 =  self.trm_encoder(item_seq, xl_memories = mems1, states = states1)
-        out, mems3, states3 =  self.trm_encoder(item_seq, xl_memories = mems2, states = states2)
+        self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        self.dropout = nn.Dropout(self.hidden_dropout_prob)
+        self.fn = nn.Linear(self.hidden_size, 1)
         
-        num_state_vectors = default(num_state_vectors, block_width)
-        xl_memories_layers = default(xl_memories_layers, tuple(range(1, depth + 1)))
-        self.xl_memories_layers = set(xl_memories_layers)
-
-        assert all([0 < layer <= depth for layer in xl_memories_layers])
-
-        recurrent_layers = default(recurrent_layers, (depth // 2,)) # default to one recurent layer at middle of the network
-        self.recurrent_layers = set(recurrent_layers)
-
-        assert all([0 < layer <= depth for layer in recurrent_layers])
-
-        self.token_emb = nn.Embedding(num_tokens, dim)
-
-        pos_mlp_dim = default(dynamic_pos_bias_dim, dim // 4)
-        self.dynamic_pos_bias_mlp = nn.Sequential(
-            nn.Linear(1, pos_mlp_dim),
-            nn.SiLU(),
-            nn.Linear(pos_mlp_dim, pos_mlp_dim),
-            nn.SiLU(),
-            nn.Linear(pos_mlp_dim, heads)
-        )
-
-        self.layers = nn.ModuleList([])
-
-        for layer in range(1, depth + 1):
-            is_recurrent_layer = layer in self.recurrent_layers
-            is_xl_layer = layer in self.xl_memories_layers
-
-            layer_num_state_vectors = num_state_vectors if is_recurrent_layer else 0
-
-            # only layers with xl memories
-            # or has recurrence in horizontal direction
-            # use qk rmsnorm (in paper, they use cosine sim attention, but i think qk rmsnorm is more proven given Vit 22B paper)
-            # one can also override to use all qk rmsnorm by setting all_layers_qk_rmsnorm = True
-
-            qk_rmsnorm = all_layers_qk_rmsnorm or is_recurrent_layer or is_xl_layer
-
-            self.layers.append(nn.ModuleList([
-                AttentionBlock(
-                    dim,
-                    causal = True,
-                    block_width = block_width,
-                    dim_head = dim_head,
-                    heads = heads,
-                    single_head_kv = single_head_kv,
-                    qk_rmsnorm = qk_rmsnorm,
-                    num_state_vectors = layer_num_state_vectors
-                ),
-                FeedForward(dim, mult = ff_mult)
-            ]))
-
-        self.to_logits = nn.Sequential(
-            LayerNorm(dim),
-            nn.Linear(dim, num_tokens, bias = False)
-        )
-
-        self.max_seq_len = max_seq_len
-        self.block_width = block_width
-
-        assert divisible_by(max_seq_len, block_width)
-
-        self.ignore_index = ignore_index
-
-        self.enhanced_recurrence = enhanced_recurrence
 
     @torch.no_grad()
     @eval_decorator
@@ -176,13 +200,14 @@ class TransNet(nn.Module):
         return_loss = False,
         xl_memories: List[torch.Tensor] = [],
         states: List[torch.Tensor] = [],
-        return_memories_and_states = None  # can force to either return memory + state or not. by default will only return when number of tokens == max_seq_len
+        return_memories_and_states = True 
+ # can force to either return memory + state or not. by default will only return when number of tokens == max_seq_len
     ):
         device = x.device
 
-        if return_loss:
-            x, labels = x[:, :-1], x[:, 1:]
-
+        
+        x, labels = x[:, :-1], x[:, 1:]
+        
         # get sequence length i and j for dynamic pos bias
 
         assert x.shape[-1] <= self.max_seq_len
@@ -191,28 +216,13 @@ class TransNet(nn.Module):
 
         # token embedding
 
-        x = self.token_emb(x)
+        #x = self.token_emb(x)
 
         # dynamic pos bias
 
-        rel_dist = torch.arange(w, dtype = x.dtype, device = device)
-        rel_dist = rearrange(rel_dist, '... -> ... 1')
-        pos_bias = self.dynamic_pos_bias_mlp(rel_dist)
-
-        i_arange = torch.arange(w, device = device)
-        j_arange = torch.arange(w * 2, device = device)
-        rel_pos = ((rearrange(i_arange, 'i -> i 1') + w) - rearrange(j_arange, 'j -> 1 j')).abs()
-
-        attn_mask = rel_pos < w  # make sure each token only looks back a block width
-        rel_pos = rel_pos.masked_fill(~attn_mask, 0)
-
-        pos_bias = pos_bias[rel_pos]
-        pos_bias = rearrange(pos_bias, 'i j h -> h i j')
-
-        # enhanced recurrence
-
-        if self.enhanced_recurrence and len(xl_memories) > 1:
-            xl_memories = [*xl_memories[1:], xl_memories[0]]
+        #rel_dist = torch.arange(w, dtype = x.dtype, device = device)
+        #rel_dist = rearrange(rel_dist, '... -> ... 1')
+        #pos_bias = self.dynamic_pos_bias_mlp(rel_dist)
 
         # ready xl memories and states
 
@@ -270,46 +280,12 @@ class TransNet(nn.Module):
             # feedforward layer
 
             x = ff(x) + x
+        #if return_loss:
 
+        loss = torch.all(torch.gt(alpha, self.theta))
+        return alpha, loss
         logits = self.to_logits(x)
 
-        if not return_loss:
-            return logits, next_xl_memories, next_states
-
-        logits = rearrange(logits, 'b n c -> b c n')
-        loss = F.cross_entropy(logits, labels, ignore_index = self.ignore_index)
-
-        return loss, next_xl_memories, next_states
-
-    def get_attention_mask(self, item_seq, bidirectional=False):
-        """Generate left-to-right uni-directional or bidirectional attention mask for multi-head attention."""
-        attention_mask = (item_seq != 0)
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.bool
-        if not bidirectional:
-            extended_attention_mask = torch.tril(extended_attention_mask.expand((-1, -1, item_seq.size(-1), -1)))
-        extended_attention_mask = torch.where(extended_attention_mask, 0., -10000.)
-        return extended_attention_mask
-
-    def forward(self, item_seq, item_emb):
-        mask = item_seq.gt(0)
-
-        position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
-        position_embedding = self.position_embedding(position_ids)
-
-        input_emb = item_emb + position_embedding
-        input_emb = self.LayerNorm(input_emb)
-        input_emb = self.dropout(input_emb)
-
-        extended_attention_mask = self.get_attention_mask(item_seq)
-
-        trm_output = self.trm_encoder(input_emb, extended_attention_mask, **kwargs)
-        output = trm_output[-1]
-
-        alpha = self.fn(output).to(torch.double)
-        alpha = torch.where(mask.unsqueeze(-1), alpha, -9e15)
-        alpha = torch.softmax(alpha, dim=1, dtype=torch.float)
-        return alpha
 
     def _init_weights(self, module):
         """ Initialize the weights """
