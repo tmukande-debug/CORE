@@ -1,0 +1,25 @@
+embedding_size: 100
+inner_size: 256
+n_layers: 2
+n_heads: 2
+hidden_dropout_prob: 0.5
+attn_dropout_prob: 0.5
+hidden_act: gelu
+layer_norm_eps: 1e-12
+initializer_range: 0.02
+loss_type: CE
+heads: 2
+num_tokens: 20000
+dim: 64
+depth: 6
+dim_head: 64
+max_seq_len: 1024
+block_width: 512
+xl_memories_layers: (5, 6)
+num_state_vectors: 512
+recurrent_layers: 4
+enhanced_recurrence: False
+
+sess_dropout: 0.2
+item_dropout: 0.2
+temperature: 0.07
